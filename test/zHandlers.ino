@@ -20,11 +20,6 @@ char ageDGPS[10];
 char vtgHeading[12] = { };
 char speedKnots[10] = { };
 
-// HPR
-char umHeading[8];
-char umRoll[8];
-int solQuality;
-
 // IMU
 char imuHeading[6];
 char imuRoll[6];
@@ -77,73 +72,31 @@ void GGA_Handler() //Rec'd GGA
     blink = !blink;
     GGA_Available = true;
 
-    dualReadyGGA = true;
-   
+    if (useDual)
+    {
+       dualReadyGGA = true;
+    }
+
+    if (useBNO08x || useCMPS)
+    {
+       imuHandler();          //Get IMU data ready
+       BuildNmea();           //Build & send data GPS data to AgIO (Both Dual & Single)
+       dualReadyGGA = false;  //Force dual GGA ready false because we just sent it to AgIO based off the IMU data
+       if (!useDual)
+       {
+        digitalWrite(GPSRED_LED, HIGH);    //Turn red GPS LED ON, we have GGA and must have a IMU     
+        digitalWrite(GPSGREEN_LED, LOW);   //Make sure the Green LED is OFF     
+       }
+    }
+    else if (!useBNO08x && !useCMPS && !useDual) 
+    {
+        digitalWrite(GPSRED_LED, blink);   //Flash red GPS LED, we have GGA but no IMU or dual
+        digitalWrite(GPSGREEN_LED, LOW);   //Make sure the Green LED is OFF
+        itoa(65535, imuHeading, 10);       //65535 is max value to stop AgOpen using IMU in Panda
+        BuildNmea();
+    }
+    
     gpsReadyTime = systick_millis_count;    //Used for GGA timeout (LED's ETC) 
-}
-
-void VTG_Handler()
-{
-  // vtg heading
-  parser.getArg(0, vtgHeading);
-
-  // vtg Speed knots
-  parser.getArg(4, speedKnots);
-}
-
-//UM982 Support
-void HPR_Handler()
-{ 
-  dualReadyRelPos = true;
-  digitalWrite(GPSRED_LED, LOW);   //Turn red GPS LED OFF (we are now in dual mode so green LED)
-
-  // HPR Heading
-  parser.getArg(1, umHeading);
-  heading = atof(umHeading);
-  if ( filterHeading )
-    {
-      float tempHeading;
-      tempHeading = headingFilter.updateEstimate(heading);
-      heading = tempHeading;
-    }
-
-  // HPR Substitute pitch for roll
-  if ( parser.getArg(2, umRoll) )
-  {
-    rollDual = atof(umRoll);
-    digitalWrite(GPSGREEN_LED, HIGH);   //Turn green GPS LED ON
-    if ( filterRoll )
-      {
-        float tempRoll;
-        tempRoll = rollFilter.updateEstimate(rollDual);
-        rollDual = tempRoll;
-      }
-  }
-  else
-  {
-    digitalWrite(GPSGREEN_LED, blink);  //Flash the green GPS LED
-  }
-
-  // Solution quality factor
-  parser.getArg(4, solQuality);
-
-  if (solQuality >= 4)
-    {
-       if (useBNO08x)
-       {
-           if (baseLineCheck)
-           {
-               imuDualDelta();         //Find the error between latest IMU reading and this dual message
-              dualReadyRelPos = false;  //RelPos ready is false because we just saved the error for running from the IMU
-           }
-
-       }
-       else
-       {
-           imuHandler();             //No IMU so use dual data direct
-           dualReadyRelPos = true;   //RelPos ready is true so PAOGI will send when the GGA is also ready
-       }
-    }
 }
 
 void readBNO()
@@ -220,142 +173,116 @@ void readBNO()
 
 void imuHandler()
 {
-  int16_t temp = 0;
+    int16_t temp = 0;
+    if (!useDual)
+    {
+        if (useCMPS)
+        {
+            //the heading x10
+            Wire.beginTransmission(CMPS14_ADDRESS);
+            Wire.write(0x1C);
+            Wire.endTransmission();
 
-  if (useBNO08x)
-  {
-      //BNO is reading in its own timer    
-      // Fill rest of Panda Sentence - Heading
-      temp = yaw;
-      itoa(temp, imuHeading, 10);
+            Wire.requestFrom(CMPS14_ADDRESS, 3);
+            while (Wire.available() < 3);
 
-      // the pitch x10
-      temp = (int16_t)pitch;
-      itoa(temp, imuPitch, 10);
+            roll = int16_t(Wire.read() << 8 | Wire.read());
+            if (invertRoll)
+            {
+                roll *= -1;
+            }
 
-      // the roll x10
-      temp = (int16_t)roll;
-      itoa(temp, imuRoll, 10);
+            // the heading x10
+            Wire.beginTransmission(CMPS14_ADDRESS);
+            Wire.write(0x02);
+            Wire.endTransmission();
 
-      // YawRate - 0 for now
-      itoa(0, imuYawRate, 10);
-  }
+            Wire.requestFrom(CMPS14_ADDRESS, 3);
+            while (Wire.available() < 3);
 
-  // No else, because we want to use dual heading and IMU roll when both connected
-  // We have a IMU so apply the dual/IMU roll/heading error to the IMU data.
-  if ( useBNO08x && baseLineCheck)
-  {
-      float dualTemp;   //To convert IMU data (x10) to a float for the PAOGI so we have the decamal point
-              
-      // the IMU heading raw
-      // dualTemp = yaw * 0.1;
-      // dtostrf(dualTemp, 3, 1, imuHeading);          
+            temp = Wire.read() << 8 | Wire.read();
+            correctionHeading = temp * 0.1;
+            correctionHeading = correctionHeading * DEG_TO_RAD;
+            itoa(temp, imuHeading, 10);
 
-      // the IMU heading fused to the dual heading
-      fuseIMU();
-      dtostrf(imuCorrected, 3, 1, imuHeading);
-    
-      // the pitch
-      dualTemp = (int16_t)pitch * 0.1;
-      dtostrf(dualTemp, 3, 1, imuPitch);
+            // 3rd byte pitch
+            int8_t pitch = Wire.read();
+            itoa(pitch, imuPitch, 10);
 
-      // the roll
-      dualTemp = (int16_t)roll * 0.1;
-      //If dual heading correction is 90deg (antennas left/right) correct the IMU roll
-      if(headingcorr == 900)
-      {
-        dualTemp += rollDeltaSmooth;
-      }
-      dtostrf(dualTemp, 3, 1, imuRoll);
+            // the roll x10
+            temp = (int16_t)roll;
+            itoa(temp, imuRoll, 10);
 
-  }
-  else  //Not using IMU so put dual Heading & Roll in direct.
-  {
-      // the roll
-      if (makeOGI)
-      {
-        dtostrf(rollDual, 4, 2, imuRoll);
-      }
-      else
-      {
-        itoa(rollDual * 10, imuRoll, 10);
-      }
+            // YawRate - 0 for now
+            itoa(0, imuYawRate, 10);
+        }
 
-      // the Dual heading raw
-      if (makeOGI)
-      {
-        dtostrf(heading, 4, 2, imuHeading);
-      }
-      else
-      {
-        itoa(heading * 10, imuHeading, 10);
-      }
+        if (useBNO08x)
+        {
+            //BNO is reading in its own timer    
+            // Fill rest of Panda Sentence - Heading
+            temp = yaw;
+            itoa(temp, imuHeading, 10);
 
-      // the pitch
-      dtostrf(pitchDual, 4, 4, imuPitch);
-  }
-}
+            // the pitch x10
+            temp = (int16_t)pitch;
+            itoa(temp, imuPitch, 10);
 
-void imuDualDelta()
-{
-                                       //correctionHeading is IMU heading in radians
-   gpsHeading = heading * DEG_TO_RAD;  //gpsHeading is Dual heading in radians
+            // the roll x10
+            temp = (int16_t)roll;
+            itoa(temp, imuRoll, 10);
 
-   //Difference between the IMU heading and the GPS heading
-   gyroDelta = (correctionHeading + imuGPS_Offset) - gpsHeading;
-   if (gyroDelta < 0) gyroDelta += twoPI;
+            // YawRate - 0 for now
+            itoa(0, imuYawRate, 10);
+        }
+    }
 
-   //calculate delta based on circular data problem 0 to 360 to 0, clamp to +- 2 Pi
-   if (gyroDelta >= -PIBy2 && gyroDelta <= PIBy2) gyroDelta *= -1.0;
-   else
-   {
-       if (gyroDelta > PIBy2) { gyroDelta = twoPI - gyroDelta; }
-       else { gyroDelta = (twoPI + gyroDelta) * -1.0; }
-   }
-   if (gyroDelta > twoPI) gyroDelta -= twoPI;
-   if (gyroDelta < -twoPI) gyroDelta += twoPI;
+    // No else, because we want to use dual heading and IMU roll when both connected
+    if (useDual)
+    {
+        // We have a IMU so apply the dual/IMU roll/heading error to the IMU data.
+//        if (useCMPS || useBNO08x)
+//        {
+//            float dualTemp;   //To convert IMU data (x10) to a float for the PAOGI so we have the decamal point
+//                     
+//            // the IMU heading raw
+////            dualTemp = yaw * 0.1;
+////            dtostrf(dualTemp, 3, 1, imuHeading);          
+//
+//            // the IMU heading fused to the dual heading
+//            fuseIMU();
+//            dtostrf(imuCorrected, 3, 1, imuHeading);
+//          
+//            // the pitch
+//            dualTemp = (int16_t)pitch * 0.1;
+//            dtostrf(dualTemp, 3, 1, imuPitch);
+//
+//            // the roll
+//            dualTemp = (int16_t)roll * 0.1;
+//            //If dual heading correction is 90deg (antennas left/right) correct the IMU roll
+//            if(headingcorr == 900)
+//            {
+//              dualTemp += rollDeltaSmooth;
+//            }
+//            dtostrf(dualTemp, 3, 1, imuRoll);
+//
+//        }
+//        else  //No IMU so put dual Heading & Roll in direct.
+        {
+            // the roll
+            dtostrf(rollDual, 4, 2, imuRoll);
 
-   //if the gyro and last corrected fix is < 10 degrees, super low pass for gps
-   if (abs(gyroDelta) < 0.18)
-   {
-       //a bit of delta and add to correction to current gyro
-       imuGPS_Offset += (gyroDelta * (0.1));
-       if (imuGPS_Offset > twoPI) imuGPS_Offset -= twoPI;
-       if (imuGPS_Offset < -twoPI) imuGPS_Offset += twoPI;
-   }
-   else
-   {
-       //a bit of delta and add to correction to current gyro
-       imuGPS_Offset += (gyroDelta * (0.2));
-       if (imuGPS_Offset > twoPI) imuGPS_Offset -= twoPI;
-       if (imuGPS_Offset < -twoPI) imuGPS_Offset += twoPI;
-   }
-
-   //So here how we have the difference between the IMU heading and the Dual GPS heading
-   //This "imuGPS_Offset" will be used in imuHandler() when the GGA arrives 
-
-   //Calculate the diffrence between dual and imu roll
-   float imuRoll;
-   imuRoll = (int16_t)roll * 0.1;
-   rollDelta = rollDual - imuRoll;
-   rollDeltaSmooth = (rollDeltaSmooth * 0.7) + (rollDelta * 0.3);
-}
-
-void fuseIMU()
-{     
-   //determine the Corrected heading based on gyro and GPS
-   imuCorrected = correctionHeading + imuGPS_Offset;
-   if (imuCorrected > twoPI) imuCorrected -= twoPI;
-   if (imuCorrected < 0) imuCorrected += twoPI;
-
-   imuCorrected = imuCorrected * RAD_TO_DEG; 
+            // the Dual heading raw
+            dtostrf(heading, 4, 2, imuHeading);
+        }
+    }
 }
 
 void BuildNmea(void)
 {
     strcpy(nmea, "");
 
-    if (makeOGI) strcat(nmea, "$PAOGI,");
+    if (useDual) strcat(nmea, "$PAOGI,");
     else strcat(nmea, "$PANDA,");
 
     strcat(nmea, fixTime);
@@ -415,8 +342,11 @@ void BuildNmea(void)
 
     strcat(nmea, "\r\n");
 
-    if (sendUSB) { SerialAOG.write(nmea); } // Send USB GPS data if enabled in user settings
-    
+    if (!passThroughGPS && !passThroughGPS2)
+    {
+        // SerialAOG.write(nmea);  //Always send USB GPS data TODO remove this andy, this was just to quieten output down
+    }
+
     if (Ethernet_running)   //If ethernet running send the GPS there
     {
         int len = strlen(nmea);
@@ -542,3 +472,14 @@ void CalculateChecksum(void)
     010.2,K      Ground speed, Kilometers per hour
      48          Checksum
 */
+
+void VTG_Handler()
+{
+  // vtg heading
+  parser.getArg(0, vtgHeading);
+
+  // vtg Speed knots
+  parser.getArg(4, speedKnots);
+
+
+}

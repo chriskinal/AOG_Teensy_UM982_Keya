@@ -14,5 +14,5 @@ void udpNtrip()
     Eth_udpNtrip.read(Eth_NTRIP_packetBuffer, packetLength);
     SerialGPS->write(Eth_NTRIP_packetBuffer, packetLength);
   }
-#endif
+ #endif
 }
